@@ -1,0 +1,7 @@
+{
+    "id": "com.flamence.spiration.openai",
+    "version": "0.1.0",
+    "main": "dist/extension.py",
+    "loader": "com.flamence.spiration.python",
+    "api_version": 0
+}
