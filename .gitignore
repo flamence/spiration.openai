@@ -1,2 +1,4 @@
 build
 cmake/ConfigureLocal.cmake
+__pycache__/
+*.py[cod]
