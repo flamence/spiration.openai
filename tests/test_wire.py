@@ -1,113 +1,57 @@
-"""``wire`` 与 ``transport`` 纯函数单元测试（不联网）。"""
+"""``wire`` 纯函数单元测试（不联网）：宿主请求 → SDK 参数，SDK 对象 → 宿主响应。"""
 
 import unittest
 
 import support  # noqa: F401 - 导入即把 dist/ 加入 sys.path
 
-import spiration_openai.transport as transport
 import spiration_openai.wire as wire
-
-
-class TransportUrlTests(unittest.TestCase):
-    """endpoint → Chat Completions URL 的归一化。"""
-
-    def test_append_path(self):
-        self.assertEqual(
-            transport.chat_completions_url("https://api.deepseek.com"),
-            "https://api.deepseek.com/chat/completions",
-        )
-
-    def test_strip_trailing_slash(self):
-        self.assertEqual(
-            transport.chat_completions_url("https://api.deepseek.com/"),
-            "https://api.deepseek.com/chat/completions",
-        )
-
-    def test_keep_existing_suffix(self):
-        self.assertEqual(
-            transport.chat_completions_url("https://host/v1/chat/completions"),
-            "https://host/v1/chat/completions",
-        )
-        self.assertEqual(
-            transport.chat_completions_url("https://host/v1/chat/completions/"),
-            "https://host/v1/chat/completions",
-        )
-
-    def test_empty_endpoint(self):
-        with self.assertRaises(RuntimeError):
-            transport.chat_completions_url("")
-        with self.assertRaises(RuntimeError):
-            transport.chat_completions_url(None)
-
-
-class TransportHeaderTests(unittest.TestCase):
-    """请求头构造。"""
-
-    def test_json_and_authorization(self):
-        headers = transport.request_headers("sk-abc", stream=False)
-        self.assertEqual(headers["Content-Type"], "application/json")
-        self.assertEqual(headers["Authorization"], "Bearer sk-abc")
-        self.assertNotIn("Accept", headers)
-
-    def test_stream_accept(self):
-        headers = transport.request_headers("sk-abc", stream=True)
-        self.assertEqual(headers["Accept"], "text/event-stream")
-
-    def test_empty_api_key_has_no_authorization(self):
-        for key in (None, "", "   "):
-            headers = transport.request_headers(key, stream=False)
-            self.assertNotIn("Authorization", headers)
-
-
-class TransportTimeoutTests(unittest.TestCase):
-    """超时值归一化。"""
-
-    def test_valid(self):
-        self.assertEqual(transport.normalize_timeout(30), 30.0)
-        self.assertEqual(transport.normalize_timeout(0.5), 0.5)
-
-    def test_fallback(self):
-        for value in (None, 0, -1, "bad", True):
-            self.assertEqual(
-                transport.normalize_timeout(value),
-                transport.DEFAULT_TIMEOUT_SECONDS,
-            )
+from support import (
+    fake_model,
+    make_completion,
+    make_message,
+    make_tool_call,
+    make_usage,
+)
 
 
 class BuildRequestTests(unittest.TestCase):
-    """宿主请求 → OpenAI 请求体。"""
+    """宿主请求 → ``chat.completions.create`` 关键字参数。"""
 
     def test_minimal_request(self):
-        body = wire.build_request(
+        kwargs = wire.build_request(
             {
                 "model": "deepseek-flash",
                 "messages": [{"role": "user", "content": "hi"}],
                 "temperature": 0.5,
             }
         )
-        self.assertEqual(body["model"], "deepseek-flash")
-        self.assertEqual(body["messages"], [{"role": "user", "content": "hi"}])
-        self.assertFalse(body["stream"])
-        self.assertEqual(body["temperature"], 0.5)
-        self.assertNotIn("max_tokens", body)
-        self.assertNotIn("tools", body)
-        self.assertNotIn("stream_options", body)
-        self.assertNotIn("reasoning_effort", body)
+        self.assertEqual(
+            kwargs,
+            {
+                "model": "deepseek-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+                "temperature": 0.5,
+            },
+        )
 
-    def test_max_tokens_only_when_positive(self):
-        for value in (0, None, -5, "x"):
-            body = wire.build_request({"model": "m", "max_tokens": value})
-            self.assertNotIn("max_tokens", body)
-        body = wire.build_request({"model": "m", "max_tokens": 128})
-        self.assertEqual(body["max_tokens"], 128)
+    def test_max_completion_tokens_only_when_positive(self):
+        for value in (0, None, -5, "x", True):
+            kwargs = wire.build_request({"model": "m", "max_tokens": value})
+            self.assertNotIn("max_completion_tokens", kwargs, value)
+            self.assertNotIn("max_tokens", kwargs, value)
+
+        for value, expected in ((128, 128), (3.9, 3), (1, 1)):
+            kwargs = wire.build_request({"model": "m", "max_tokens": value})
+            self.assertEqual(kwargs["max_completion_tokens"], expected, value)
 
     def test_stream_options(self):
-        body = wire.build_request({"model": "m", "stream": True})
-        self.assertTrue(body["stream"])
-        self.assertEqual(body["stream_options"], {"include_usage": True})
+        kwargs = wire.build_request({"model": "m", "stream": True})
+        self.assertTrue(kwargs["stream"])
+        self.assertEqual(kwargs["stream_options"], {"include_usage": True})
 
     def test_tools_conversion(self):
-        body = wire.build_request(
+        kwargs = wire.build_request(
             {
                 "model": "m",
                 "tools": [
@@ -121,7 +65,7 @@ class BuildRequestTests(unittest.TestCase):
             }
         )
         self.assertEqual(
-            body["tools"],
+            kwargs["tools"],
             [
                 {
                     "type": "function",
@@ -143,8 +87,8 @@ class BuildRequestTests(unittest.TestCase):
         )
 
     def test_empty_tools_omitted(self):
-        body = wire.build_request({"model": "m", "tools": []})
-        self.assertNotIn("tools", body)
+        kwargs = wire.build_request({"model": "m", "tools": []})
+        self.assertNotIn("tools", kwargs)
 
     def test_reasoning_effort_mapping(self):
         cases = {
@@ -158,11 +102,35 @@ class BuildRequestTests(unittest.TestCase):
             "unknown": "medium",
         }
         for reasoning, expected in cases.items():
-            body = wire.build_request({"model": "m", "reasoning": reasoning})
+            kwargs = wire.build_request({"model": "m", "reasoning": reasoning})
             if expected is None:
-                self.assertNotIn("reasoning_effort", body, reasoning)
+                self.assertNotIn("reasoning_effort", kwargs, reasoning)
             else:
-                self.assertEqual(body["reasoning_effort"], expected, reasoning)
+                self.assertEqual(kwargs["reasoning_effort"], expected, reasoning)
+
+    def test_temperature_fallback(self):
+        for value in (None, True, "hot", [], {}):
+            kwargs = wire.build_request({"model": "m", "temperature": value})
+            self.assertEqual(kwargs["temperature"], 0, value)
+        for value in (0.7, 2, 0):
+            kwargs = wire.build_request({"model": "m", "temperature": value})
+            self.assertEqual(kwargs["temperature"], value)
+
+    def test_invalid_messages_skipped(self):
+        kwargs = wire.build_request(
+            {
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    "not a dict",
+                    None,
+                    42,
+                ],
+            }
+        )
+        self.assertEqual(
+            kwargs["messages"], [{"role": "user", "content": "hi"}]
+        )
 
 
 class ConvertMessageTests(unittest.TestCase):
@@ -238,35 +206,98 @@ class ConvertMessageTests(unittest.TestCase):
             {"role": "tool", "tool_call_id": "call_1", "content": "结果"},
         )
 
+    def test_tool_message_without_id(self):
+        self.assertEqual(
+            wire.convert_message({"role": "tool", "content": "结果"}),
+            {"role": "tool", "tool_call_id": "", "content": "结果"},
+        )
+
+    def test_non_string_arguments_normalized(self):
+        converted = wire.convert_assistant_tool_calls(
+            [{"id": "call_1", "function_name": "f", "arguments": {"path": "a"}}]
+        )
+        self.assertEqual(converted[0]["function"]["arguments"], "")
+
+    def test_non_dict_tool_calls_skipped(self):
+        self.assertEqual(
+            wire.convert_assistant_tool_calls([None, "bad", {"id": "call_1"}]),
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                }
+            ],
+        )
+
+
+class ReasoningTextTests(unittest.TestCase):
+    """服务端扩展字段的读取（直接属性 + ``model_extra`` 两种形态）。"""
+
+    def test_direct_attribute(self):
+        self.assertEqual(
+            wire.reasoning_text(fake_model(reasoning_content="直接属性")),
+            "直接属性",
+        )
+
+    def test_model_extra_attribute(self):
+        self.assertEqual(
+            wire.reasoning_text(fake_model(_extra={"reasoning_content": "扩展字段"})),
+            "扩展字段",
+        )
+
+    def test_reasoning_alias(self):
+        self.assertEqual(
+            wire.reasoning_text(fake_model(reasoning="别名")), "别名"
+        )
+        self.assertEqual(
+            wire.reasoning_text(fake_model(_extra={"reasoning": "扩展别名"})),
+            "扩展别名",
+        )
+
+    def test_reasoning_content_preferred_over_alias(self):
+        self.assertEqual(
+            wire.reasoning_text(fake_model(reasoning_content="A", reasoning="B")),
+            "A",
+        )
+        self.assertEqual(
+            wire.reasoning_text(
+                fake_model(_extra={"reasoning_content": "A", "reasoning": "B"})
+            ),
+            "A",
+        )
+
+    def test_empty_values_normalized_to_none(self):
+        for obj in (
+            fake_model(reasoning_content=""),
+            fake_model(_extra={"reasoning_content": ""}),
+            fake_model(reasoning_content=None),
+            fake_model(),
+            None,
+        ):
+            self.assertIsNone(wire.reasoning_text(obj), obj)
+
+    def test_non_dict_model_extra_ignored(self):
+        self.assertIsNone(wire.reasoning_text(fake_model(model_extra="bad")))
+
 
 class ParseResponseTests(unittest.TestCase):
     """非流式响应解析。"""
 
     def test_full_response(self):
-        payload = {
-            "choices": [
-                {
-                    "message": {
-                        "content": "你好",
-                        "reasoning_content": "先想一想",
-                        "tool_calls": [
-                            {
-                                "id": "call_1",
-                                "type": "function",
-                                "function": {
-                                    "name": "read_file",
-                                    "arguments": '{"path":"a"}',
-                                },
-                            }
-                        ],
-                    },
-                    "finish_reason": "tool_calls",
-                }
-            ],
-            "usage": {"prompt_tokens": 12, "completion_tokens": 7},
-        }
+        completion = make_completion(
+            message=make_message(
+                content="你好",
+                reasoning_content="先想一想",
+                tool_calls=[
+                    make_tool_call(0, "call_1", "read_file", '{"path":"a"}')
+                ],
+            ),
+            finish_reason="tool_calls",
+            usage=make_usage(12, 7),
+        )
         self.assertEqual(
-            wire.parse_response(payload),
+            wire.parse_response(completion),
             {
                 "content": "你好",
                 "reasoning_content": "先想一想",
@@ -283,17 +314,40 @@ class ParseResponseTests(unittest.TestCase):
             },
         )
 
+    def test_reasoning_only_keeps_content_none(self):
+        completion = make_completion(
+            message=make_message(content=None, reasoning_content="只思考"),
+            finish_reason="length",
+            usage=make_usage(41, 32),
+        )
+        response = wire.parse_response(completion)
+        self.assertIsNone(response["content"])
+        self.assertEqual(response["reasoning_content"], "只思考")
+        self.assertEqual(response["finish_reason"], "length")
+
     def test_reasoning_alias(self):
-        payload = {
-            "choices": [{"message": {"content": "答", "reasoning": "想一想"}}]
-        }
-        response = wire.parse_response(payload)
-        self.assertEqual(response["reasoning_content"], "想一想")
+        completion = make_completion(
+            message=make_message(content="答", reasoning="想一想")
+        )
+        self.assertEqual(
+            wire.parse_response(completion)["reasoning_content"], "想一想"
+        )
+
+    def test_empty_content_normalized_to_none(self):
+        completion = make_completion(
+            message=make_message(content="", reasoning_content="")
+        )
+        response = wire.parse_response(completion)
+        self.assertIsNone(response["content"])
+        self.assertIsNone(response["reasoning_content"])
 
     def test_missing_fields(self):
-        response = wire.parse_response({"choices": [{"message": {}}]})
+        completion = fake_model(
+            choices=[fake_model(message=fake_model(), finish_reason=None)],
+            usage=None,
+        )
         self.assertEqual(
-            response,
+            wire.parse_response(completion),
             {
                 "content": None,
                 "reasoning_content": None,
@@ -305,34 +359,39 @@ class ParseResponseTests(unittest.TestCase):
         )
 
     def test_empty_choices(self):
-        response = wire.parse_response({"choices": []})
+        response = wire.parse_response(fake_model(choices=[], usage=None))
         self.assertIsNone(response["content"])
         self.assertEqual(response["finish_reason"], "")
 
-    def test_empty_content_normalized_to_none(self):
-        payload = {"choices": [{"message": {"content": "", "reasoning_content": ""}}]}
-        response = wire.parse_response(payload)
-        self.assertIsNone(response["content"])
-        self.assertIsNone(response["reasoning_content"])
-
-
-class ExtractErrorTests(unittest.TestCase):
-    """服务端错误对象提取。"""
-
-    def test_no_error(self):
-        self.assertIsNone(wire.extract_error({"choices": []}))
-        self.assertIsNone(wire.extract_error({"error": None}))
-        self.assertIsNone(wire.extract_error("not a dict"))
-
-    def test_dict_error(self):
-        message = wire.extract_error(
-            {"error": {"message": "invalid api key", "code": "invalid_api_key"}}
+    def test_none_completion(self):
+        self.assertEqual(
+            wire.parse_response(None),
+            {
+                "content": None,
+                "reasoning_content": None,
+                "tool_calls": [],
+                "finish_reason": "",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+            },
         )
-        self.assertIn("invalid api key", message)
-        self.assertIn("invalid_api_key", message)
 
-    def test_string_error(self):
-        self.assertIn("quota", wire.extract_error({"error": "quota exceeded"}))
+    def test_tool_call_without_function(self):
+        completion = make_completion(
+            message=make_message(tool_calls=[fake_model(id="call_2", function=None)])
+        )
+        self.assertEqual(
+            wire.parse_response(completion)["tool_calls"],
+            [{"id": "call_2", "function_name": "", "arguments": ""}],
+        )
+
+    def test_usage_invalid_values(self):
+        completion = make_completion(
+            usage=fake_model(prompt_tokens="12", completion_tokens=True)
+        )
+        response = wire.parse_response(completion)
+        self.assertEqual(response["prompt_tokens"], 0)
+        self.assertEqual(response["completion_tokens"], 0)
 
 
 class TokenCountTests(unittest.TestCase):

@@ -80,7 +80,17 @@ class ExtensionEntryTests(unittest.TestCase):
         for attribute in ("name", "description", "version"):
             self.assertIsInstance(getattr(module, attribute), str, attribute)
             self.assertTrue(getattr(module, attribute), attribute)
+        self.assertIn("OpenAI", module.description)
+        self.assertIn("SDK", module.description)
         self.assertEqual(module.PROVIDER_NAME, "openai")
+
+    def test_entry_does_not_construct_a_client(self):
+        """加载入口只注册 provider，不构造 SDK 客户端（首次加载无需联网）。"""
+        spiration = _FakeSpiration()
+        module = _load_extension(spiration)
+        self.assertTrue(module.initialize())
+        _, provider = spiration.agent.registered[0]
+        self.assertEqual(provider._clients, {})
 
 
 class InitializeTests(unittest.TestCase):

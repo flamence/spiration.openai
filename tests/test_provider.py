@@ -1,128 +1,50 @@
-"""OpenAIProvider 端到端测试：本地 http.server 模拟 Chat Completions 端点。
+"""``OpenAIProvider`` 单元测试：注入假 client / 假 SDK 对象，完全不联网。"""
 
-所有测试只访问 127.0.0.1 上临时启动的 HTTP 服务，不依赖外网与宿主。
-"""
-
-import json
-import socket
 import threading
-import time
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from support import FakeStream, make_request
+import openai
 
+import support  # noqa: F401 - 导入即把 dist/ 加入 sys.path
+
+import spiration_openai.provider as provider_module
+from support import (
+    FakeClient,
+    FakeClientFactory,
+    FakeSdkStream,
+    FakeStream,
+    make_chunk,
+    make_completion,
+    make_connection_error,
+    make_delta,
+    make_message,
+    make_request,
+    make_status_error,
+    make_timeout_error,
+    make_tool_call,
+    make_usage,
+    make_usage_chunk,
+)
 from spiration_openai.provider import OpenAIProvider
 
 
-class _Handler(BaseHTTPRequestHandler):
-    """把请求记录到服务器上，再交给当前 responder 生成响应。"""
-
-    # 默认 HTTP/1.0：响应结束即关闭连接，无需 Content-Length，便于测试流式。
-    protocol_version = "HTTP/1.0"
-
-    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler 的约定命名
-        """处理一次 POST 请求。"""
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length > 0 else b""
-        try:
-            body = json.loads(raw.decode("utf-8")) if raw else {}
-        except ValueError:
-            body = {}
-        with self.server.lock:
-            self.server.requests.append(
-                {
-                    "path": self.path,
-                    "headers": dict(self.headers),
-                    "body": body,
-                }
-            )
-        try:
-            self.server.responder(self, body)
-        except OSError:
-            # 客户端提前断开（中止路径）时写入失败属预期，忽略。
-            pass
-        except Exception as err:  # noqa: BLE001 - 交给测试线程断言
-            self.server.errors.append(err)
-
-    def log_message(self, fmt, *args):  # noqa: A003 - 覆盖基类以静默测试输出
-        """关闭默认的访问日志输出。"""
+def _provider(result=None, error=None, clients=None):
+    """构造注入了假 client 的 provider，返回 ``(provider, client, factory)``。"""
+    client = FakeClient(result=result, error=error)
+    factory = FakeClientFactory(clients if clients is not None else [client])
+    return OpenAIProvider(client_factory=factory), client, factory
 
 
-class _MockServer:
-    """在 127.0.0.1 的随机端口上运行一个 OpenAI 兼容端点。"""
+class _BrokenFactory:
+    """构造客户端时抛异常的假工厂。"""
 
-    def __init__(self, responder):
-        self.httpd = HTTPServer(("127.0.0.1", 0), _Handler)
-        self.httpd.responder = responder
-        self.httpd.requests = []
-        self.httpd.errors = []
-        self.httpd.lock = threading.Lock()
-        self._thread = threading.Thread(
-            target=self.httpd.serve_forever,
-            kwargs={"poll_interval": 0.02},
-            daemon=True,
-        )
+    def __init__(self, error):
+        self.error = error
+        self.calls = 0
 
-    @property
-    def endpoint(self):
-        """端点地址（不含 /chat/completions）。"""
-        host, port = self.httpd.server_address[:2]
-        return f"http://{host}:{port}"
-
-    @property
-    def requests(self):
-        """收到的请求记录列表。"""
-        with self.httpd.lock:
-            return list(self.httpd.requests)
-
-    @property
-    def errors(self):
-        """responder 中未被预期的异常列表。"""
-        return list(self.httpd.errors)
-
-    def __enter__(self):
-        self._thread.start()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.httpd.shutdown()
-        self.httpd.server_close()
-        self._thread.join(timeout=5)
-        return False
-
-
-def _write_json(handler, payload, status=200):
-    """写出 JSON 响应。"""
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json")
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
-    handler.wfile.write(body)
-
-
-def _write_sse(handler, chunks, delay=0.0):
-    """把 chunk 列表写成 SSE 流（末尾追加 [DONE]）。"""
-    handler.send_response(200)
-    handler.send_header("Content-Type", "text/event-stream")
-    handler.end_headers()
-    for chunk in chunks:
-        if delay:
-            time.sleep(delay)
-        data = json.dumps(chunk, ensure_ascii=False).encode("utf-8")
-        handler.wfile.write(b"data: " + data + b"\n\n")
-        handler.wfile.flush()
-    handler.wfile.write(b"data: [DONE]\n\n")
-    handler.wfile.flush()
-
-
-def _header(headers, name):
-    """大小写不敏感地取请求头。"""
-    for key, value in headers.items():
-        if key.lower() == name.lower():
-            return value
-    return None
+    def __call__(self, **kwargs):
+        self.calls += 1
+        raise self.error
 
 
 class ProviderMetadataTests(unittest.TestCase):
@@ -135,33 +57,145 @@ class ProviderMetadataTests(unittest.TestCase):
             provider.reasoning_levels(), ["none", "low", "medium", "high"]
         )
 
+    def test_reasoning_levels_is_copy(self):
+        provider = OpenAIProvider()
+        levels = provider.reasoning_levels()
+        levels.append("xhigh")
+        self.assertEqual(
+            provider.reasoning_levels(), ["none", "low", "medium", "high"]
+        )
+
+
+class NormalizeTests(unittest.TestCase):
+    """超时/端点/密钥归一化。"""
+
+    def test_timeout(self):
+        self.assertEqual(
+            provider_module.normalize_timeout(30), 30.0
+        )
+        self.assertEqual(provider_module.normalize_timeout(0.5), 0.5)
+        for value in (None, 0, -1, "bad", True):
+            self.assertEqual(
+                provider_module.normalize_timeout(value),
+                provider_module.DEFAULT_TIMEOUT_SECONDS,
+                value,
+            )
+
+    def test_endpoint(self):
+        self.assertEqual(
+            provider_module.normalize_endpoint("  https://api.test/v1  "),
+            "https://api.test/v1",
+        )
+        for value in (None, "", "   "):
+            with self.assertRaises(RuntimeError):
+                provider_module.normalize_endpoint(value)
+
+    def test_api_key(self):
+        self.assertEqual(provider_module.normalize_api_key("  sk-abc  "), "sk-abc")
+        for value in (None, "", "   "):
+            self.assertEqual(
+                provider_module.normalize_api_key(value),
+                provider_module.ANONYMOUS_API_KEY,
+            )
+
+
+class ClientCacheTests(unittest.TestCase):
+    """client 缓存：按 (endpoint, api_key, timeout) 复用。"""
+
+    def test_reuses_client_for_same_config(self):
+        completion = make_completion(message=make_message(content="ok"))
+        provider, client, factory = _provider(result=completion)
+        for _ in range(2):
+            provider.execute(make_request(), FakeStream())
+        self.assertEqual(len(factory.init_kwargs), 1)
+        self.assertEqual(len(client.calls), 2)
+
+    def test_new_client_for_different_api_key(self):
+        completion = make_completion(message=make_message(content="ok"))
+        clients = [
+            FakeClient(result=completion),
+            FakeClient(result=completion),
+        ]
+        provider, _, factory = _provider(clients=clients)
+        provider.execute(make_request(api_key="sk-a"), FakeStream())
+        provider.execute(make_request(api_key="sk-b"), FakeStream())
+        self.assertEqual(len(factory.init_kwargs), 2)
+        self.assertEqual(len(clients[0].calls), 1)
+        self.assertEqual(len(clients[1].calls), 1)
+
+    def test_new_client_for_different_timeout(self):
+        completion = make_completion(message=make_message(content="ok"))
+        clients = [
+            FakeClient(result=completion),
+            FakeClient(result=completion),
+        ]
+        provider, _, factory = _provider(clients=clients)
+        provider.execute(make_request(timeout_seconds=1), FakeStream())
+        provider.execute(make_request(timeout_seconds=2), FakeStream())
+        self.assertEqual(len(factory.init_kwargs), 2)
+
+    def test_client_construction_options(self):
+        completion = make_completion(message=make_message(content="ok"))
+        provider, _, factory = _provider(result=completion)
+        provider.execute(make_request(), FakeStream())
+        self.assertEqual(
+            factory.init_kwargs[0],
+            {
+                "api_key": "sk-test",
+                "base_url": support.DEFAULT_ENDPOINT,
+                "timeout": 5.0,
+                "max_retries": 0,
+            },
+        )
+
+    def test_empty_api_key_uses_placeholder(self):
+        completion = make_completion(message=make_message(content="ok"))
+        provider, _, factory = _provider(result=completion)
+        provider.execute(make_request(api_key=""), FakeStream())
+        self.assertEqual(
+            factory.init_kwargs[0]["api_key"], provider_module.ANONYMOUS_API_KEY
+        )
+
+    def test_concurrent_calls_share_cached_client(self):
+        completion = make_completion(message=make_message(content="ok"))
+        provider, client, factory = _provider(result=completion)
+        errors = []
+
+        def run():
+            try:
+                provider.execute(make_request(), FakeStream())
+            except Exception as err:  # noqa: BLE001 - 交给主线程断言
+                errors.append(err)
+
+        threads = [threading.Thread(target=run) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(factory.init_kwargs), 1)
+        self.assertEqual(len(client.calls), 4)
+
+    def test_client_construction_error_mapped(self):
+        factory = _BrokenFactory(openai.OpenAIError("Missing credentials."))
+        provider = OpenAIProvider(client_factory=factory)
+        with self.assertRaises(RuntimeError) as caught:
+            provider.execute(make_request(api_key=""), FakeStream())
+        self.assertIn("OpenAI 客户端错误", str(caught.exception))
+        self.assertIn("Missing credentials", str(caught.exception))
+
 
 class NonStreamTests(unittest.TestCase):
-    """非流式端到端。"""
+    """非流式执行。"""
 
-    def test_request_and_response(self):
-        response_payload = {
-            "choices": [
-                {
-                    "message": {
-                        "content": "最终答案",
-                        "reasoning_content": "答案思考",
-                        "tool_calls": [
-                            {
-                                "id": "call_9",
-                                "type": "function",
-                                "function": {
-                                    "name": "sleep",
-                                    "arguments": '{"seconds":1}',
-                                },
-                            }
-                        ],
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {"prompt_tokens": 100, "completion_tokens": 20},
-        }
+    def test_create_kwargs_and_result(self):
+        completion = make_completion(
+            message=make_message(content="最终答案"),
+            finish_reason="stop",
+            usage=make_usage(100, 20),
+        )
+        provider, client, _ = _provider(result=completion)
+
         messages = [
             {"role": "system", "content": "你是助手"},
             {"role": "user", "content": "读文件"},
@@ -186,24 +220,86 @@ class NonStreamTests(unittest.TestCase):
                 "parameters": {"type": "object", "properties": {}},
             }
         ]
+        request = make_request(
+            messages=messages,
+            tools=tools,
+            max_tokens=64,
+            temperature=0.3,
+            reasoning="medium",
+        )
+        stream = FakeStream()
+        result = provider.execute(request, stream)
 
-        with _MockServer(
-            lambda handler, body: _write_json(handler, response_payload)
-        ) as server:
-            request = make_request(
-                server.endpoint,
-                messages=messages,
-                tools=tools,
-                max_tokens=64,
-                temperature=0.3,
-                reasoning="medium",
-                stream=False,
-            )
-            stream = FakeStream()
-            result = OpenAIProvider().execute(request, stream)
-            records = server.requests
-            self.assertEqual(server.errors, [])
+        self.assertEqual(
+            result,
+            {
+                "content": "最终答案",
+                "reasoning_content": None,
+                "tool_calls": [],
+                "finish_reason": "stop",
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+            },
+        )
+        # 非流式不调用流式回调。
+        self.assertEqual(stream.content_chunks, [])
+        self.assertEqual(stream.reasoning_chunks, [])
 
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(
+            client.calls[0],
+            {
+                "model": "test-model",
+                "messages": [
+                    {"role": "system", "content": "你是助手"},
+                    {"role": "user", "content": "读文件"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": '{"path":"a"}',
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "内容"},
+                ],
+                "stream": False,
+                "temperature": 0.3,
+                "max_completion_tokens": 64,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "description": "读取文件",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                "reasoning_effort": "medium",
+            },
+        )
+
+    def test_response_with_reasoning_and_tool_calls(self):
+        completion = make_completion(
+            message=make_message(
+                content="最终答案",
+                reasoning_content="答案思考",
+                tool_calls=[
+                    make_tool_call(0, "call_9", "sleep", '{"seconds":1}')
+                ],
+            ),
+            finish_reason="tool_calls",
+            usage=make_usage(100, 20),
+        )
+        provider, _, _ = _provider(result=completion)
+        result = provider.execute(make_request(), FakeStream())
         self.assertEqual(
             result,
             {
@@ -216,209 +312,63 @@ class NonStreamTests(unittest.TestCase):
                         "arguments": '{"seconds":1}',
                     }
                 ],
-                "finish_reason": "stop",
+                "finish_reason": "tool_calls",
                 "prompt_tokens": 100,
                 "completion_tokens": 20,
             },
         )
-        # 非流式不触发流式回调。
-        self.assertEqual(stream.content_chunks, [])
-        self.assertEqual(stream.reasoning_chunks, [])
 
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["path"], "/chat/completions")
-        self.assertEqual(
-            _header(records[0]["headers"], "Authorization"), "Bearer sk-test"
+    def test_reasoning_only_response_keeps_content_none(self):
+        completion = make_completion(
+            message=make_message(content=None, reasoning_content="只思考"),
+            finish_reason="length",
+            usage=make_usage(41, 32),
         )
-        self.assertEqual(
-            _header(records[0]["headers"], "Content-Type"), "application/json"
-        )
-        self.assertIsNone(_header(records[0]["headers"], "Accept"))
+        provider, _, _ = _provider(result=completion)
+        result = provider.execute(make_request(), FakeStream())
+        self.assertIsNone(result["content"])
+        self.assertEqual(result["reasoning_content"], "只思考")
 
-        body = records[0]["body"]
-        self.assertEqual(body["model"], "test-model")
-        self.assertFalse(body["stream"])
-        self.assertEqual(body["temperature"], 0.3)
-        self.assertEqual(body["max_tokens"], 64)
-        self.assertNotIn("stream_options", body)
-        self.assertEqual(body["reasoning_effort"], "medium")
-        self.assertEqual(
-            body["tools"],
-            [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "description": "读取文件",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                }
-            ],
-        )
-        self.assertEqual(
-            body["messages"],
-            [
-                {"role": "system", "content": "你是助手"},
-                {"role": "user", "content": "读文件"},
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {
-                                "name": "read_file",
-                                "arguments": '{"path":"a"}',
-                            },
-                        }
-                    ],
-                },
-                {"role": "tool", "tool_call_id": "call_1", "content": "内容"},
-            ],
-        )
-        # reasoning_content 不能被发回服务端。
-        self.assertNotIn("reasoning_content", body["messages"][2])
-
-    def test_endpoint_with_full_path(self):
-        with _MockServer(
-            lambda handler, body: _write_json(
-                handler, {"choices": [{"message": {"content": "ok"}}]}
-            )
-        ) as server:
-            request = make_request(server.endpoint + "/chat/completions")
-            result = OpenAIProvider().execute(request, FakeStream())
-            records = server.requests
-        self.assertEqual(result["content"], "ok")
-        self.assertEqual(records[0]["path"], "/chat/completions")
-
-    def test_http_error_raises_with_body_preview(self):
-        error_payload = {"error": {"message": "invalid api key"}}
-        with _MockServer(
-            lambda handler, body: _write_json(handler, error_payload, status=401)
-        ) as server:
-            request = make_request(server.endpoint)
-            with self.assertRaises(RuntimeError) as caught:
-                OpenAIProvider().execute(request, FakeStream())
-            self.assertEqual(len(server.requests), 1)  # 不重试
-
-        message = str(caught.exception)
-        self.assertIn("401", message)
-        self.assertIn("invalid api key", message)
-
-    def test_error_payload_with_http_200_raises(self):
-        with _MockServer(
-            lambda handler, body: _write_json(
-                handler, {"error": {"message": "quota exceeded"}}
-            )
-        ) as server:
-            request = make_request(server.endpoint)
-            with self.assertRaises(RuntimeError) as caught:
-                OpenAIProvider().execute(request, FakeStream())
-        self.assertIn("quota exceeded", str(caught.exception))
-
-    def test_invalid_json_response_raises(self):
-        def responder(handler, body):
-            handler.send_response(200)
-            handler.send_header("Content-Type", "application/json")
-            handler.end_headers()
-            handler.wfile.write(b"not json at all")
-
-        with _MockServer(responder) as server:
-            with self.assertRaises(RuntimeError) as caught:
-                OpenAIProvider().execute(
-                    make_request(server.endpoint), FakeStream()
-                )
-        self.assertIn("解析", str(caught.exception))
-
-    def test_connection_error_raises(self):
-        probe = socket.socket()
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-        probe.close()
-        request = make_request(f"http://127.0.0.1:{port}", timeout_seconds=1)
-        with self.assertRaises(RuntimeError):
-            OpenAIProvider().execute(request, FakeStream())
-
-    def test_timeout_raises(self):
-        def responder(handler, body):
-            time.sleep(0.6)
-            _write_json(handler, {"choices": [{"message": {"content": "late"}}]})
-
-        with _MockServer(responder) as server:
-            request = make_request(server.endpoint, timeout_seconds=0.1)
-            started = time.monotonic()
+    def test_invalid_request_type(self):
+        provider, client, factory = _provider(result=make_completion())
+        for request in (None, "x", [], 42):
             with self.assertRaises(RuntimeError):
-                OpenAIProvider().execute(request, FakeStream())
-            self.assertLess(time.monotonic() - started, 3.0)
+                provider.execute(request, FakeStream())
+        self.assertEqual(factory.init_kwargs, [])
+        self.assertEqual(client.calls, [])
 
-    def test_missing_endpoint_raises(self):
-        with self.assertRaises(RuntimeError):
-            OpenAIProvider().execute({"model": "m"}, FakeStream())
+    def test_missing_endpoint_raises_without_client(self):
+        provider, client, factory = _provider(result=make_completion())
+        with self.assertRaises(RuntimeError) as caught:
+            provider.execute(make_request(endpoint="  "), FakeStream())
+        self.assertIn("endpoint", str(caught.exception))
+        self.assertEqual(factory.init_kwargs, [])
+        self.assertEqual(client.calls, [])
 
 
 class StreamTests(unittest.TestCase):
-    """流式端到端。"""
+    """流式执行。"""
 
-    STREAM_CHUNKS = [
-        {"choices": [{"delta": {"role": "assistant", "reasoning_content": "想"}}]},
-        {"choices": [{"delta": {"reasoning_content": "一想"}}]},
-        {"choices": [{"delta": {"content": "你好"}}]},
-        {"choices": [{"delta": {"content": "！"}}]},
-        {
-            "choices": [
-                {
-                    "delta": {
-                        "tool_calls": [
-                            {
-                                "index": 0,
-                                "id": "call_1",
-                                "type": "function",
-                                "function": {
-                                    "name": "read_",
-                                    "arguments": '{"pa',
-                                },
-                            }
-                        ]
-                    }
-                }
-            ]
-        },
-        {
-            "choices": [
-                {
-                    "delta": {
-                        "tool_calls": [
-                            {
-                                "index": 0,
-                                "function": {
-                                    "name": "file",
-                                    "arguments": 'th":"a"}',
-                                },
-                            }
-                        ]
-                    }
-                }
-            ]
-        },
-        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
-        {
-            "choices": [],
-            "usage": {"prompt_tokens": 12, "completion_tokens": 7},
-        },
-    ]
-
-    def test_request_and_response(self):
-        with _MockServer(
-            lambda handler, body: _write_sse(handler, self.STREAM_CHUNKS)
-        ) as server:
-            request = make_request(
-                server.endpoint, stream=True, reasoning="none", timeout_seconds=5
-            )
-            stream = FakeStream()
-            result = OpenAIProvider().execute(request, stream)
-            records = server.requests
-            self.assertEqual(server.errors, [])
+    def test_stream_result_deltas_and_kwargs(self):
+        chunks = [
+            make_chunk(make_delta(reasoning_content="想")),
+            make_chunk(make_delta(reasoning_content="一想")),
+            make_chunk(make_delta(content="你好")),
+            make_chunk(make_delta(content="！")),
+            make_chunk(
+                make_delta(
+                    tool_calls=[
+                        make_tool_call(0, "call_1", "read_file", '{"path":"a"}')
+                    ]
+                )
+            ),
+            make_chunk(finish_reason="tool_calls"),
+            make_usage_chunk(12, 7),
+        ]
+        sdk_stream = FakeSdkStream(chunks)
+        provider, client, _ = _provider(result=sdk_stream)
+        host_stream = FakeStream()
+        result = provider.execute(make_request(stream=True), host_stream)
 
         self.assertEqual(
             result,
@@ -437,91 +387,136 @@ class StreamTests(unittest.TestCase):
                 "completion_tokens": 7,
             },
         )
-        self.assertEqual(stream.content_chunks, ["你好", "！"])
-        self.assertEqual(stream.reasoning_chunks, ["想", "一想"])
+        self.assertEqual(host_stream.content_chunks, ["你好", "！"])
+        self.assertEqual(host_stream.reasoning_chunks, ["想", "一想"])
+        self.assertEqual(sdk_stream.consumed, len(chunks))
+        self.assertTrue(sdk_stream.closed)
 
-        self.assertEqual(len(records), 1)
-        self.assertEqual(
-            _header(records[0]["headers"], "Accept"), "text/event-stream"
-        )
-        body = records[0]["body"]
-        self.assertTrue(body["stream"])
-        self.assertEqual(body["stream_options"], {"include_usage": True})
-        self.assertNotIn("reasoning_effort", body)
-
-    def test_malformed_chunk_and_comments_skipped(self):
-        def responder(handler, body):
-            handler.send_response(200)
-            handler.send_header("Content-Type", "text/event-stream")
-            handler.end_headers()
-            handler.wfile.write(b": keep-alive\n\n")
-            handler.wfile.write(b"event: message\n")
-            handler.wfile.write(b"data: {this is not json}\n\n")
-            handler.wfile.write(
-                b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
-            )
-            handler.wfile.write(b"data: [DONE]\n\n")
-            handler.wfile.write(b'data: {"choices":[{"delta":{"content":"ignored"}}]}\n\n')
-            handler.wfile.flush()
-
-        with _MockServer(responder) as server:
-            result = OpenAIProvider().execute(
-                make_request(server.endpoint, stream=True), FakeStream()
-            )
-        self.assertEqual(result["content"], "ok")
-        self.assertEqual(server.errors, [])
+        kwargs = client.calls[0]
+        self.assertTrue(kwargs["stream"])
+        self.assertEqual(kwargs["stream_options"], {"include_usage": True})
+        self.assertNotIn("reasoning_effort", kwargs)
 
     def test_stream_abort_returns_partial_content(self):
         chunks = [
-            {"choices": [{"delta": {"content": "A"}}]},
-            {"choices": [{"delta": {"content": "B"}}]},
-            {"choices": [{"delta": {"content": "C"}, "finish_reason": "stop"}]},
+            make_chunk(make_delta(content="A")),
+            make_chunk(make_delta(content="B"), finish_reason="stop"),
+            make_chunk(make_delta(content="C")),
         ]
-        with _MockServer(
-            lambda handler, body: _write_sse(handler, chunks, delay=0.02)
-        ) as server:
-            stream = FakeStream(stop_after_deltas=1)
-            result = OpenAIProvider().execute(
-                make_request(server.endpoint, stream=True), stream
-            )
+        sdk_stream = FakeSdkStream(chunks)
+        provider, _, _ = _provider(result=sdk_stream)
+        host_stream = FakeStream(stop_after_deltas=1)
+        result = provider.execute(make_request(stream=True), host_stream)
+
         self.assertEqual(result["content"], "A")
-        self.assertEqual(stream.content_chunks, ["A"])
-        # 中止后不再读取 finish_reason。
         self.assertEqual(result["finish_reason"], "")
+        self.assertEqual(host_stream.content_chunks, ["A"])
+        self.assertEqual(sdk_stream.consumed, 1)
+        self.assertTrue(sdk_stream.closed)
 
-    def test_stream_error_chunk_raises(self):
+    def test_stream_reasoning_only(self):
         chunks = [
-            {"choices": [{"delta": {"content": "开始"}}]},
-            {"error": {"message": "server overloaded"}},
+            make_chunk(make_delta(reasoning_content="思考")),
+            make_chunk(make_delta(reasoning_content="过程")),
         ]
-        with _MockServer(lambda handler, body: _write_sse(handler, chunks)) as server:
-            with self.assertRaises(RuntimeError) as caught:
-                OpenAIProvider().execute(
-                    make_request(server.endpoint, stream=True), FakeStream()
-                )
-        self.assertIn("server overloaded", str(caught.exception))
-
-    def test_stream_http_error_raises(self):
-        with _MockServer(
-            lambda handler, body: _write_json(
-                handler, {"error": {"message": "bad request"}}, status=400
-            )
-        ) as server:
-            with self.assertRaises(RuntimeError) as caught:
-                OpenAIProvider().execute(
-                    make_request(server.endpoint, stream=True), FakeStream()
-                )
-        self.assertIn("400", str(caught.exception))
-
-    def test_stream_without_usage_keeps_zero_tokens(self):
-        chunks = [{"choices": [{"delta": {"content": "hi"}}]}]
-        with _MockServer(lambda handler, body: _write_sse(handler, chunks)) as server:
-            result = OpenAIProvider().execute(
-                make_request(server.endpoint, stream=True), FakeStream()
-            )
-        self.assertEqual(result["content"], "hi")
+        sdk_stream = FakeSdkStream(chunks)
+        provider, _, _ = _provider(result=sdk_stream)
+        host_stream = FakeStream()
+        result = provider.execute(make_request(stream=True), host_stream)
+        self.assertIsNone(result["content"])
+        self.assertEqual(result["reasoning_content"], "思考过程")
+        self.assertEqual(host_stream.reasoning_chunks, ["思考", "过程"])
         self.assertEqual(result["prompt_tokens"], 0)
         self.assertEqual(result["completion_tokens"], 0)
+
+    def test_stream_create_error_mapped(self):
+        provider, client, _ = _provider(
+            error=make_status_error(400, text='{"error": {"message": "bad request"}}')
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            provider.execute(make_request(stream=True), FakeStream())
+        self.assertIn("400", str(caught.exception))
+        self.assertIn("bad request", str(caught.exception))
+        # 不重试：只发起一次请求。
+        self.assertEqual(len(client.calls), 1)
+
+    def test_stream_iteration_error_mapped_and_closed(self):
+        sdk_stream = FakeSdkStream(
+            [make_chunk(make_delta(content="开始"))],
+            error=make_connection_error(),
+        )
+        provider, _, _ = _provider(result=sdk_stream)
+        with self.assertRaises(RuntimeError) as caught:
+            provider.execute(make_request(stream=True), FakeStream())
+        self.assertIn("连接", str(caught.exception))
+        self.assertTrue(sdk_stream.closed)
+
+    def test_stream_close_error_swallowed(self):
+        class _BadCloseStream(FakeSdkStream):
+            def close(self):
+                super().close()
+                raise OSError("close failed")
+
+        sdk_stream = _BadCloseStream([make_chunk(make_delta(content="ok"))])
+        provider, _, _ = _provider(result=sdk_stream)
+        result = provider.execute(make_request(stream=True), FakeStream())
+        self.assertEqual(result["content"], "ok")
+        self.assertTrue(sdk_stream.closed)
+
+
+class ErrorMappingTests(unittest.TestCase):
+    """SDK 异常 → RuntimeError（不重试）。"""
+
+    def test_status_error_with_body_preview(self):
+        provider, client, _ = _provider(
+            error=make_status_error(
+                401, text='{"error": {"message": "invalid api key"}}'
+            )
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            provider.execute(make_request(), FakeStream())
+        message = str(caught.exception)
+        self.assertIn("401", message)
+        self.assertIn("invalid api key", message)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_status_error_without_response_text(self):
+        provider, _, _ = _provider(
+            error=make_status_error(
+                500,
+                text="",
+                body={"error": {"message": "server overloaded"}},
+            )
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            provider.execute(make_request(), FakeStream())
+        message = str(caught.exception)
+        self.assertIn("500", message)
+        self.assertIn("server overloaded", message)
+
+    def test_timeout_error(self):
+        provider, _, _ = _provider(error=make_timeout_error())
+        with self.assertRaises(RuntimeError) as caught:
+            provider.execute(make_request(), FakeStream())
+        message = str(caught.exception)
+        self.assertIn("超时", message)
+        self.assertIn("timed out", message)
+
+    def test_connection_error(self):
+        provider, _, _ = _provider(
+            error=make_connection_error("Connection error.")
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            provider.execute(make_request(), FakeStream())
+        self.assertIn("连接", str(caught.exception))
+
+    def test_generic_api_error(self):
+        provider, _, _ = _provider(
+            error=openai.APIError("服务器内部错误", request=None, body=None)
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            provider.execute(make_request(), FakeStream())
+        self.assertIn("服务器内部错误", str(caught.exception))
 
 
 if __name__ == "__main__":

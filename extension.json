@@ -6,5 +6,8 @@
     "api_version": 0,
     "depends": {
         "com.flamence.spiration.python": ">=0.1.0"
+    },
+    "python": {
+        "requirements": ["openai>=3.37,<4"]
     }
 }

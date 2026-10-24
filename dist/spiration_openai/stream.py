@@ -1,16 +1,15 @@
-"""SSE（Server-Sent Events）解析与增量累积。
+"""官方 ``openai`` SDK 流式 chunk 的累积器。
 
-- :func:`iter_sse_payloads`：把响应行序列还原为 ``data:`` 载荷；
-- :class:`StreamAssembler`：把流式 chunk 累积为宿主所需的完整响应，
-  同时给出每个 chunk 的正文/思考增量。
+- :class:`StreamAssembler`：把 ``ChatCompletionChunk`` 序列累积为宿主所需的
+  完整响应，同时给出每个 chunk 的正文/思考增量；
+- ``chunk.choices`` 可能为空（纯 usage chunk）、``chunk.usage`` 可能为 None，
+  这些都由 SDK 的模型对象表达；
+- 服务端扩展字段（``reasoning_content``）的读取统一走 :func:`wire.reasoning_text`。
 """
 
 from typing import NamedTuple
 
 from . import wire
-
-#: SSE 流结束标记。
-SSE_DONE = "[DONE]"
 
 
 class Delta(NamedTuple):
@@ -18,34 +17,6 @@ class Delta(NamedTuple):
 
     content: str
     reasoning: str
-
-
-def iter_sse_payloads(lines):
-    """从 SSE 行序列中逐个产出 ``data:`` 字段的载荷文本。
-
-    - 跳过空行、以 ``:`` 开头的注释行以及 ``event:`` / ``id:`` / ``retry:``
-      等非数据字段；
-    - 遇到 ``data: [DONE]`` 时结束迭代（其后的行不再读取）。
-    """
-    for raw in lines:
-        if isinstance(raw, (bytes, bytearray)):
-            line = bytes(raw).decode("utf-8", errors="replace")
-        else:
-            line = str(raw)
-        line = line.rstrip("\r\n")
-        if not line or line.startswith(":"):
-            continue
-        if not line.startswith("data:"):
-            continue
-        payload = line[5:]
-        if payload.startswith(" "):
-            payload = payload[1:]
-        payload = payload.strip()
-        if not payload:
-            continue
-        if payload == SSE_DONE:
-            return
-        yield payload
 
 
 class _ToolCallAccumulator:
@@ -58,7 +29,7 @@ class _ToolCallAccumulator:
 
 
 class StreamAssembler:
-    """累积流式 chunk，产出完整的补全响应。"""
+    """累积 SDK 流式 chunk，产出完整的补全响应。"""
 
     def __init__(self):
         self._content_parts = []
@@ -69,45 +40,44 @@ class StreamAssembler:
         self.completion_tokens = 0
 
     def feed(self, chunk):
-        """吸收一个 chunk，返回需要上报给宿主的增量。
+        """吸收一个 ``ChatCompletionChunk``，返回需要上报给宿主的增量。
 
-        对 ``choices`` 为空的用量 chunk（最后一个 chunk）同样会读取 ``usage``。
+        对 ``choices`` 为空的用量 chunk（通常是最后一个 chunk）同样会读取
+        ``usage``。
         """
-        if not isinstance(chunk, dict):
+        if chunk is None:
             return Delta("", "")
 
-        self._feed_usage(chunk.get("usage"))
+        self._feed_usage(getattr(chunk, "usage", None))
 
-        choices = chunk.get("choices")
-        if not isinstance(choices, list) or not choices:
+        choices = getattr(chunk, "choices", None)
+        if not isinstance(choices, (list, tuple)) or not choices:
             return Delta("", "")
-        choice = choices[0] if isinstance(choices[0], dict) else None
+        choice = choices[0]
         if choice is None:
             return Delta("", "")
 
-        finish_reason = choice.get("finish_reason")
-        if finish_reason:
+        finish_reason = getattr(choice, "finish_reason", None)
+        if isinstance(finish_reason, str) and finish_reason:
             self.finish_reason = finish_reason
 
-        delta = choice.get("delta")
-        delta = delta if isinstance(delta, dict) else {}
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            return Delta("", "")
 
         content = ""
-        text = delta.get("content")
+        text = getattr(delta, "content", None)
         if isinstance(text, str) and text:
             self._content_parts.append(text)
             content = text
 
         reasoning = ""
-        reasoning_text = delta.get("reasoning_content")
-        if not isinstance(reasoning_text, str) or not reasoning_text:
-            # 部分兼容端点把该字段命名为 reasoning。
-            reasoning_text = delta.get("reasoning")
-        if isinstance(reasoning_text, str) and reasoning_text:
+        reasoning_text = wire.reasoning_text(delta)
+        if reasoning_text:
             self._reasoning_parts.append(reasoning_text)
             reasoning = reasoning_text
 
-        self._accumulate_tool_calls(delta.get("tool_calls"))
+        self._accumulate_tool_calls(getattr(delta, "tool_calls", None))
         return Delta(content, reasoning)
 
     def result(self):
@@ -135,21 +105,23 @@ class StreamAssembler:
 
     def _feed_usage(self, usage):
         """吸收 token 用量；字段缺省时保留已有值。"""
-        if not isinstance(usage, dict):
+        if usage is None:
             return
-        if "prompt_tokens" in usage:
-            self.prompt_tokens = wire.token_count(usage.get("prompt_tokens"))
-        if "completion_tokens" in usage:
-            self.completion_tokens = wire.token_count(usage.get("completion_tokens"))
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        if prompt_tokens is not None:
+            self.prompt_tokens = wire.token_count(prompt_tokens)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        if completion_tokens is not None:
+            self.completion_tokens = wire.token_count(completion_tokens)
 
     def _accumulate_tool_calls(self, raw_calls):
-        """按 ``index`` 累积工具调用片段。"""
-        if not isinstance(raw_calls, list):
+        """按 SDK 元素自带的 ``index`` 累积工具调用片段。"""
+        if not isinstance(raw_calls, (list, tuple)):
             return
         for item in raw_calls:
-            if not isinstance(item, dict):
+            if item is None:
                 continue
-            index = item.get("index")
+            index = getattr(item, "index", None)
             if isinstance(index, bool) or not isinstance(index, int):
                 index = 0
             call = self._tool_calls.get(index)
@@ -157,16 +129,16 @@ class StreamAssembler:
                 call = _ToolCallAccumulator()
                 self._tool_calls[index] = call
 
-            call_id = item.get("id")
+            call_id = getattr(item, "id", None)
             if isinstance(call_id, str) and call_id and not call.id:
                 call.id = call_id
 
-            function = item.get("function")
-            if not isinstance(function, dict):
+            function = getattr(item, "function", None)
+            if function is None:
                 continue
-            name = function.get("name")
+            name = getattr(function, "name", None)
             if isinstance(name, str) and name:
                 call.name += name
-            arguments = function.get("arguments")
-            if isinstance(arguments, str):
+            arguments = getattr(function, "arguments", None)
+            if isinstance(arguments, str) and arguments:
                 call.argument_parts.append(arguments)

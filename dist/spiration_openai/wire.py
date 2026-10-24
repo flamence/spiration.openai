@@ -1,9 +1,17 @@
-"""宿主补全请求/响应与 OpenAI Chat Completions 线上格式之间的转换。
+"""宿主补全请求/响应与官方 ``openai`` SDK 对象之间的转换。
 
-本模块不发起网络请求，纯函数便于单元测试；流式解析见 ``stream`` 模块。
+本模块不发起网络请求，纯函数便于单元测试；SDK 流式 chunk 的累积见
+``stream`` 模块。
+
+协议要点（openai 3.37.0 实测）：
+
+- 非流式响应是 ``ChatCompletion`` 对象，流式响应是可迭代的
+  ``ChatCompletionChunk`` 序列；
+- 服务端扩展字段（如 DeepSeek 的 ``reasoning_content``）由 SDK 放进模型对象的
+  ``model_extra``，同时也能通过 ``getattr`` 直接读取，统一用
+  :func:`reasoning_text` 提取；
+- 现代 Chat Completions 用 ``max_completion_tokens`` 表达输出上限。
 """
-
-import json
 
 #: 本 provider 声明的思考挡位（与宿主 reasoning_level 名称一致）。
 REASONING_LEVELS = ("none", "low", "medium", "high")
@@ -18,14 +26,15 @@ _REASONING_EFFORT = {
     "max": "high",
 }
 
+#: 工具未提供 parameters 时的缺省 JSON Schema。
 _DEFAULT_TOOL_PARAMETERS = {"type": "object", "properties": {}}
 
 
 def build_request(request):
-    """把宿主补全请求（dict）转换为 OpenAI Chat Completions 请求体。"""
+    """把宿主补全请求（dict）转换为 ``chat.completions.create`` 的关键字参数。"""
     request = request or {}
     stream = bool(request.get("stream"))
-    body = {
+    kwargs = {
         "model": request.get("model") or "",
         "messages": [
             convert_message(message)
@@ -38,7 +47,9 @@ def build_request(request):
 
     max_tokens = _positive_int(request.get("max_tokens"))
     if max_tokens:
-        body["max_tokens"] = max_tokens
+        # 现代 OpenAI Chat Completions 的输出上限字段；DeepSeek 等兼容端点
+        # 实测同样接受该字段。
+        kwargs["max_completion_tokens"] = max_tokens
 
     tools = [
         convert_tool(tool)
@@ -46,16 +57,16 @@ def build_request(request):
         if isinstance(tool, dict)
     ]
     if tools:
-        body["tools"] = tools
+        kwargs["tools"] = tools
 
     if stream:
         # 请求最后一个 chunk 携带 token 用量；不支持的端点会忽略该字段。
-        body["stream_options"] = {"include_usage": True}
+        kwargs["stream_options"] = {"include_usage": True}
 
     effort = reasoning_effort(request.get("reasoning"))
     if effort:
-        body["reasoning_effort"] = effort
-    return body
+        kwargs["reasoning_effort"] = effort
+    return kwargs
 
 
 def reasoning_effort(reasoning):
@@ -127,9 +138,12 @@ def convert_tool(tool):
     }
 
 
-def parse_response(payload):
-    """解析非流式响应的 JSON 文档为宿主响应结构。"""
-    payload = payload if isinstance(payload, dict) else {}
+def parse_response(completion):
+    """把非流式 ``ChatCompletion`` 对象解析为宿主响应结构。
+
+    ``content`` 为 None（例如思考模型把 token 全用在思考过程上）时原样保留
+    None，不伪造空串。
+    """
     response = {
         "content": None,
         "reasoning_content": None,
@@ -139,41 +153,74 @@ def parse_response(payload):
         "completion_tokens": 0,
     }
 
-    choice = _first_choice(payload)
+    choices = getattr(completion, "choices", None)
+    choice = choices[0] if isinstance(choices, (list, tuple)) and choices else None
     if choice is not None:
-        message = choice.get("message")
-        message = message if isinstance(message, dict) else {}
-        response["content"] = _text_or_none(message.get("content"))
-        # 部分兼容端点把思考过程命名为 reasoning。
-        reasoning = message.get("reasoning_content") or message.get("reasoning")
-        response["reasoning_content"] = _text_or_none(reasoning)
-        response["tool_calls"] = parse_tool_calls(message.get("tool_calls"))
-        response["finish_reason"] = choice.get("finish_reason") or ""
+        message = getattr(choice, "message", None)
+        if message is not None:
+            response["content"] = _text_or_none(getattr(message, "content", None))
+            response["reasoning_content"] = reasoning_text(message)
+            response["tool_calls"] = parse_tool_calls(
+                getattr(message, "tool_calls", None)
+            )
+        finish_reason = getattr(choice, "finish_reason", None)
+        response["finish_reason"] = (
+            finish_reason if isinstance(finish_reason, str) else ""
+        )
 
-    usage = payload.get("usage")
-    if isinstance(usage, dict):
-        response["prompt_tokens"] = token_count(usage.get("prompt_tokens"))
-        response["completion_tokens"] = token_count(usage.get("completion_tokens"))
+    usage = getattr(completion, "usage", None)
+    if usage is not None:
+        response["prompt_tokens"] = token_count(getattr(usage, "prompt_tokens", None))
+        response["completion_tokens"] = token_count(
+            getattr(usage, "completion_tokens", None)
+        )
     return response
 
 
 def parse_tool_calls(raw_calls):
-    """解析 OpenAI 响应中的 ``tool_calls`` 数组为宿主工具调用结构。"""
+    """解析 SDK 响应中的 ``tool_calls`` 数组为宿主工具调用结构。"""
+    if not isinstance(raw_calls, (list, tuple)):
+        return []
     calls = []
-    for item in raw_calls or []:
-        if not isinstance(item, dict):
+    for item in raw_calls:
+        if item is None:
             continue
-        function = item.get("function")
-        function = function if isinstance(function, dict) else {}
-        arguments = function.get("arguments")
+        function = getattr(item, "function", None)
+        name = getattr(function, "name", None) if function is not None else None
+        arguments = (
+            getattr(function, "arguments", None) if function is not None else None
+        )
         calls.append(
             {
-                "id": item.get("id") or "",
-                "function_name": function.get("name") or "",
+                "id": _text_or_none(getattr(item, "id", None)) or "",
+                "function_name": _text_or_none(name) or "",
                 "arguments": arguments if isinstance(arguments, str) else "",
             }
         )
     return calls
+
+
+def reasoning_text(obj):
+    """读取服务端扩展字段中的思考过程；没有（或为空）时返回 None。
+
+    SDK 3.37.0 会同时以直接属性和 ``model_extra`` 键暴露 ``reasoning_content``，
+    这里兼容两种形态（并兼容部分兼容端点使用的 ``reasoning`` 别名）。
+    读取顺序：``reasoning_content`` 直接属性 → ``reasoning`` 直接属性 →
+    ``model_extra`` 中的同名字段；空串/None 一律归一为 None。
+    """
+    if obj is None:
+        return None
+    for name in ("reasoning_content", "reasoning"):
+        text = _text_or_none(getattr(obj, name, None))
+        if text is not None:
+            return text
+    extra = getattr(obj, "model_extra", None)
+    if isinstance(extra, dict):
+        for name in ("reasoning_content", "reasoning"):
+            text = _text_or_none(extra.get(name))
+            if text is not None:
+                return text
+    return None
 
 
 def token_count(value):
@@ -185,38 +232,6 @@ def token_count(value):
     if isinstance(value, float) and value > 0:
         return int(value)
     return 0
-
-
-def extract_error(payload):
-    """从响应 JSON 中提取服务端错误摘要；没有错误时返回 None。
-
-    个别兼容端点以 HTTP 200 + ``{"error": {...}}`` 的形式报错，因此需要
-    与非流式响应解析分开检查。
-    """
-    if not isinstance(payload, dict):
-        return None
-    error = payload.get("error")
-    if not error:
-        return None
-    if isinstance(error, dict):
-        detail = (
-            error.get("message")
-            or error.get("detail")
-            or json.dumps(error, ensure_ascii=False)
-        )
-        code = error.get("code") or error.get("type")
-        if code:
-            return f"服务端返回错误（{code}）：{detail}"
-        return f"服务端返回错误：{detail}"
-    return f"服务端返回错误：{error}"
-
-
-def _first_choice(payload):
-    """取 ``choices[0]``，不存在时返回 None。"""
-    choices = payload.get("choices")
-    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-        return choices[0]
-    return None
 
 
 def _text_or_none(value):
