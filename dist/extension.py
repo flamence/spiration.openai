@@ -3,13 +3,13 @@
 加载器（``com.flamence.spiration.python``）会按 ``extension.json`` 中
 ``python.requirements`` 的声明安装官方 ``openai`` SDK，注入 ``spiration``
 模块后调用本文件的 ``initialize`` / ``shutdown``；``initialize`` 向宿主注册
-名为 ``openai`` 的智能体 provider，由 :class:`spiration_openai.provider.OpenAIProvider`
+名为 ``openai`` 的智能体 provider，由 :class:`spiration.openai.provider.OpenAIProvider`
 负责把补全请求转发到 OpenAI Chat Completions 兼容端点。
 """
 
 import spiration
 
-from spiration_openai.provider import OpenAIProvider
+from spiration.openai.provider import OpenAIProvider
 
 #: 拓展元信息（加载器读取后展示在拓展列表中）。
 name = "OpenAI"
